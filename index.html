@@ -4904,6 +4904,10 @@ const replay = {
     // minimum gap of 1 second enforced there is equivalent at M1 granularity.
     if (epoch - this.replayLastSigEpoch < 60) return;
 
+    // ── Market regime gate — mirrors runStrategy live gate ──
+    // DEAD markets have no meaningful price movement; skip them in backtest too.
+    if (detectMarketRegime() === 'DEAD') return;
+
     // ── Backtest news awareness — bot ALWAYS trades, adapts lot/spread to news context ──
     const ns = btNewsStateAt(epoch, this.newsEvents || []);
     // Log news context briefly (throttled to avoid spam)
@@ -4918,13 +4922,35 @@ const replay = {
     const bs = strategy.evalBuy(price);
     const ss = strategy.evalSell(price);
     let sig = null;
-    if (bs.signal && bs.sweepIdx !== undefined && bs.sweepIdx !== this.replayLastBullSwp) {
-      sig = { dir: 'UP', ob: bs.ob, quality: bs.quality, sweepIdx: bs.sweepIdx };
-      this.replayLastBullSwp = bs.sweepIdx; this.replayLastBearSwp = -1;
-    } else if (ss.signal && ss.sweepIdx !== undefined && ss.sweepIdx !== this.replayLastBearSwp) {
-      sig = { dir: 'DOWN', ob: ss.ob, quality: ss.quality, sweepIdx: ss.sweepIdx };
-      this.replayLastBearSwp = ss.sweepIdx; this.replayLastBullSwp = -1;
+
+    // ── Epoch + price dedup — mirrors runStrategy live dedup exactly ──
+    // OLD code used sweepIdx (array index in the sliding completedM1 window).
+    // That index shifts by 1 every bar as the window advances, so the same
+    // sweep candle gets a new index each bar and the dedup never fires →
+    // the same liquidity pool gets re-traded on every bar after a close.
+    // FIX: use epoch (seconds) + price-level proximity, same as live mode.
+    const SWEEP_COOLDOWN_S  = 20 * 60;  // 20-minute cooldown (in epoch seconds)
+    const SWEEP_PRICE_TOL   = 0.3;      // 0.3 pt price-level tolerance
+
+    const isBullDup = bs.sweepEpoch !== undefined && bs.score < 9 && (
+      (epoch - this.replayLastBullEpoch < SWEEP_COOLDOWN_S) ||
+      (Math.abs((bs.sweepLow  || 0) - this.replayLastBullPrice) < SWEEP_PRICE_TOL)
+    );
+    const isBearDup = ss.sweepEpoch !== undefined && ss.score < 9 && (
+      (epoch - this.replayLastBearEpoch < SWEEP_COOLDOWN_S) ||
+      (Math.abs((ss.sweepHigh || 0) - this.replayLastBearPrice) < SWEEP_PRICE_TOL)
+    );
+
+    if (bs.signal && bs.sweepEpoch !== undefined && !isBullDup) {
+      sig = { dir: 'UP', ob: bs.ob, quality: bs.quality };
+      this.replayLastBullEpoch = epoch;
+      this.replayLastBullPrice = bs.sweepLow  || 0;
+    } else if (ss.signal && ss.sweepEpoch !== undefined && !isBearDup) {
+      sig = { dir: 'DOWN', ob: ss.ob, quality: ss.quality };
+      this.replayLastBearEpoch = epoch;
+      this.replayLastBearPrice = ss.sweepHigh || 0;
     }
+
     if (sig) {
       // PRE_RELEASE: prefer quality ≥ 2 (momentum setups) — low quality signals less reliable during spike
       if (ns.state === 'PRE_RELEASE' && sig.quality < 2) return; // skip ★ during release spike
@@ -5226,14 +5252,23 @@ async function fetchBtCandles(granularity, startEpoch, endEpoch, onProgress) {
   btFetching = true;
 
   // Fetch one page ending at `end`.  No `start` param — filter client-side.
+  // Uses a settle-flag so the promise always resolves/rejects exactly once,
+  // even when the WS closes unexpectedly without sending data (Deriv rate limit).
   const fetchPage = (end, gran) => new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null; ws.close(); } catch(_) {}
+      fn(val);
+    };
     let ws;
     try { ws = new WebSocket(DERIV_WS_URL); }
     catch(e) { reject(e); return; }
     const timer = setTimeout(() => {
-      ws.onclose = null; ws.close();
-      reject(new Error('Deriv request timed out after 20s'));
-    }, 20000);
+      finish(reject, new Error('Deriv request timed out after 25s'));
+    }, 25000);
     ws.onopen = () => {
       ws.send(JSON.stringify({
         ticks_history   : DERIV_SYMBOL,
@@ -5245,30 +5280,40 @@ async function fetchBtCandles(granularity, startEpoch, endEpoch, onProgress) {
       }));
     };
     ws.onmessage = evt => {
-      clearTimeout(timer);
-      ws.onclose = null; ws.close();
       try {
         const msg = JSON.parse(evt.data);
-        if (msg.error) { reject(new Error(msg.error.message)); return; }
+        if (msg.error) { finish(reject, new Error(msg.error.message)); return; }
         if (msg.msg_type === 'candles' && msg.candles) {
-          resolve(msg.candles.map(c => ({
+          finish(resolve, msg.candles.map(c => ({
             epoch: +c.epoch, open: +c.open, high: +c.high, low: +c.low, close: +c.close
           })));
-        } else { resolve([]); }
-      } catch(e) { reject(e); }
+        } else { finish(resolve, []); }
+      } catch(e) { finish(reject, e); }
     };
-    ws.onerror = () => { clearTimeout(timer); reject(new Error('WebSocket error')); };
-    ws.onclose = () => { clearTimeout(timer); };
+    ws.onerror = () => { finish(reject, new Error('WebSocket error')); };
+    // CRITICAL: onclose must reject (not just clear timer) to prevent a promise
+    // hang when Deriv closes the connection without sending any data (rate limit).
+    ws.onclose = () => { finish(reject, new Error('WebSocket closed before data received')); };
   });
 
   try {
     while (cursor > startEpoch && !btCancelled && reqCount < MAX_PAGES) {
-      let chunk;
-      try {
-        chunk = await fetchPage(cursor, granularity);
-      } catch(e) {
-        addSignal('warn', `BT data fetch error: ${e.message}`, null);
-        break;
+      let chunk = null;
+      // Retry each page up to 3 times with exponential back-off so a transient
+      // Deriv rate-limit or connection drop doesn't abort the entire fetch.
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          chunk = await fetchPage(cursor, granularity);
+          break; // success
+        } catch(e) {
+          if (attempt === 3) {
+            addSignal('warn', `BT fetch error (page ${reqCount + 1}, attempt ${attempt}): ${e.message} — stopping pagination`, null);
+            chunk = null;
+          } else {
+            addSignal('info', `BT fetch retry ${attempt}/3 (page ${reqCount + 1}): ${e.message}`, null);
+            await new Promise(r => setTimeout(r, 800 * attempt));
+          }
+        }
       }
       if (!chunk || !chunk.length) break;
 
@@ -5290,7 +5335,7 @@ async function fetchBtCandles(granularity, startEpoch, endEpoch, onProgress) {
       // Move cursor back before the earliest bar in this chunk and fetch the next page.
       cursor = chunk[0].epoch - granularity;
       if (cursor <= startEpoch) break;
-      await new Promise(r => setTimeout(r, 400)); // polite rate limit
+      await new Promise(r => setTimeout(r, 600)); // polite rate limit (increased from 400ms)
     }
   } finally {
     btFetching = false;
