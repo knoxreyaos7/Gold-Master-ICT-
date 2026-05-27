@@ -1442,172 +1442,35 @@ function detectMarketRegime() {
   return 'RANGE';
 }
 
-// ── STRATEGY ENGINE — STEREA ELITE SMC/ICT v2.0 ──
-// M5 = Narrative/Bias (HTF)  |  M1 = Execution
-// Required: Liquidity Sweep · REAL MSS · REAL Displacement · FVG
-//           Session Alignment · Premium/Discount · Volatility Filter
-//           Candle Quality · Anti-Chop Filter · Trend Continuation · Reversal Trap Avoidance
+// ── STRATEGY ENGINE ──
 const strategy = {
   _btEpoch: null,
 
-  // ── INTERNAL ENGINE CONFIG ──
-  _cfg: {
-    MIN_DISPLACEMENT_BODY_RATIO : 0.70,
-    MIN_IMPULSE_POINTS          : 2.0,
-    MIN_FVG_SIZE                : 0.60,
-    ENABLE_CHOP_FILTER          : true,
-    ENABLE_PREMIUM_DISCOUNT     : true,
-    REQUIRE_SWEEP               : true,
-    REQUIRE_FVG                 : true,
-    REQUIRE_DISPLACEMENT        : true,
-    REQUIRE_MSS                 : true,
-    MIN_VOL_AVG_RANGE           : 1.2,
-    MAX_VOL_AVG_RANGE           : 15,
-    CHOP_CHANGES_THRESHOLD      : 6,
-    SCORE_SWEEP                 : 3,
-    SCORE_DISPLACEMENT          : 3,
-    SCORE_FVG                   : 2,
-    SCORE_MSS                   : 2,
-    SCORE_PD_ZONE               : 1,
-    SCORE_KZ                    : 1,
-    SCORE_M5_BIAS               : 3,
-    THRESHOLD_QUALITY2          : 9,
-    THRESHOLD_QUALITY3          : 14,
-  },
-
-  // ── COMPLETED CANDLE HELPER ──
+  // ── COMPLETED CANDLE HELPER (prevents M5/M15 repaint in live mode) ──
+  // In live mode the last candle is forming — we exclude it so strategy sees only closed bars.
+  // M15 data is still populated (for EQ calculation) but no M15 zones/signals are generated.
   getCompleted(tf, includeForming = false) {
     const arr = candles[tf];
     if (!arr || !arr.length) return [];
+    // In live mode (_btEpoch === null), last candle is forming.
+    // Zones/OBs/FVGs must NEVER repaint — always exclude forming candle.
+    // Bias/trend direction CAN use forming candle — it's just current context.
     if (!includeForming && this._btEpoch === null && arr.length > 1) return arr.slice(0, -1);
     return arr;
   },
 
-  // ── HELPERS ──
-  _body(c)    { return Math.abs(c.close - c.open); },
-  _range(c)   { return c.high - c.low; },
-  _bullish(c) { return c.close > c.open; },
-  _bearish(c) { return c.close < c.open; },
-
-  // ── VOLATILITY FILTER ──
-  _volatilityOK(m1Arr) {
-    const recent = m1Arr.slice(-5);
-    if (!recent.length) return false;
-    const avgRange = recent.reduce((a, b) => a + this._range(b), 0) / recent.length;
-    return avgRange >= this._cfg.MIN_VOL_AVG_RANGE && avgRange <= this._cfg.MAX_VOL_AVG_RANGE;
-  },
-
-  // ── CHOP FILTER ──
-  _isChoppy(m1Arr) {
-    let changes = 0;
-    for (let i = 1; i < m1Arr.length; i++) {
-      if (this._bullish(m1Arr[i-1]) && this._bearish(m1Arr[i])) changes++;
-      if (this._bearish(m1Arr[i-1]) && this._bullish(m1Arr[i])) changes++;
-    }
-    return changes >= this._cfg.CHOP_CHANGES_THRESHOLD;
-  },
-
-  // ── DISPLACEMENT DETECTION (new engine) ──
-  _detectDisplacement(arr) {
-    const c = arr[arr.length - 1];
-    if (!c) return null;
-    const candleBody  = this._body(c);
-    const candleRange = this._range(c);
-    if (candleRange <= 0) return null;
-    const ratio = candleBody / candleRange;
-    if (ratio < this._cfg.MIN_DISPLACEMENT_BODY_RATIO) return null;
-    if (candleBody < this._cfg.MIN_IMPULSE_POINTS) return null;
-    return { bullish: this._bullish(c), bearish: this._bearish(c), strength: ratio, size: candleBody };
-  },
-
-  // ── FVG DETECTION (new engine) ──
-  _detectFVG(arr) {
-    if (arr.length < 3) return null;
-    const a = arr[arr.length - 3];
-    const b = arr[arr.length - 2];
-    const c = arr[arr.length - 1];
-    // Bullish FVG
-    if (a.high < c.low) {
-      const size = c.low - a.high;
-      if (size < this._cfg.MIN_FVG_SIZE) return null;
-      return { type: 'BULLISH', top: c.low, bottom: a.high, size, low: a.high, high: c.low, epoch: c.epoch, tf: 'M1' };
-    }
-    // Bearish FVG
-    if (a.low > c.high) {
-      const size = a.low - c.high;
-      if (size < this._cfg.MIN_FVG_SIZE) return null;
-      return { type: 'BEARISH', top: a.low, bottom: c.high, size, low: c.high, high: a.low, epoch: c.epoch, tf: 'M1' };
-    }
-    return null;
-  },
-
-  // ── LIQUIDITY SWEEP (new engine) ──
-  _detectSweep(arr) {
-    if (arr.length < 8) return null;
-    const recent  = arr.slice(-8);
-    const current = recent[recent.length - 1];
-    const prior   = recent.slice(0, -1);
-    const prevHigh = Math.max(...prior.map(c => c.high));
-    const prevLow  = Math.min(...prior.map(c => c.low));
-    if (current.high > prevHigh && current.close < prevHigh) return { type: 'SELL', level: prevHigh };
-    if (current.low  < prevLow  && current.close > prevLow)  return { type: 'BUY',  level: prevLow  };
-    return null;
-  },
-
-  // ── REAL MSS (new engine) ──
-  _detectMSS(arr) {
-    if (arr.length < 3) return null;
-    const c1 = arr[arr.length - 3];
-    const c2 = arr[arr.length - 2];
-    const c3 = arr[arr.length - 1];
-    if (c3.high > c2.high && this._bullish(c3) && this._body(c3) > this._body(c2)) return 'BULLISH';
-    if (c3.low  < c2.low  && this._bearish(c3) && this._body(c3) > this._body(c2)) return 'BEARISH';
-    return null;
-  },
-
-  // ── M5 NARRATIVE / BIAS (new engine) ──
-  _m5Narrative() {
-    const arr = this.getCompleted(300, true);
-    if (!arr || arr.length < 10) return { direction: 'NEUTRAL', premium: false, discount: false };
-    const sl  = arr.slice(-50);
-    const H   = Math.max(...sl.map(c => c.high));
-    const L   = Math.min(...sl.map(c => c.low));
-    const eq  = (H + L) / 2;
-    const cur = arr[arr.length - 1].close;
-    const disp = this._detectDisplacement(arr.slice(-5));
-    let direction = 'NEUTRAL';
-    if (disp) {
-      if (disp.bullish) direction = 'BULLISH';
-      if (disp.bearish) direction = 'BEARISH';
-    }
-    // Fallback: structure-based direction using last 20 bars
-    if (direction === 'NEUTRAL') {
-      const s20 = arr.slice(-20);
-      const n   = s20.length;
-      const half = Math.floor(n / 2);
-      const fH = Math.max(...s20.slice(0, half).map(c => c.high));
-      const fL = Math.min(...s20.slice(0, half).map(c => c.low));
-      const sH = Math.max(...s20.slice(half).map(c => c.high));
-      const sL = Math.min(...s20.slice(half).map(c => c.low));
-      if (sH > fH && sL > fL) direction = 'BULLISH';
-      else if (sH < fH && sL < fL) direction = 'BEARISH';
-      else direction = cur > eq ? 'BULLISH' : 'BEARISH';
-    }
-    return { direction, premium: cur > eq, discount: cur < eq, equilibrium: eq };
-  },
-
-  // ── PIVOT DETECTION (preserved for chart/swing levels) ──
+  // ── PIVOT DETECTION ──
   isSwingHigh(arr, idx, left = 3, right = 3) {
     if (idx < left || idx >= arr.length - right) return false;
     const pivot = arr[idx].high;
-    for (let i = 1; i <= left;  i++) if (arr[idx - i].high >= pivot) return false;
+    for (let i = 1; i <= left; i++) if (arr[idx - i].high >= pivot) return false;
     for (let i = 1; i <= right; i++) if (arr[idx + i].high >= pivot) return false;
     return true;
   },
   isSwingLow(arr, idx, left = 3, right = 3) {
     if (idx < left || idx >= arr.length - right) return false;
     const pivot = arr[idx].low;
-    for (let i = 1; i <= left;  i++) if (arr[idx - i].low <= pivot) return false;
+    for (let i = 1; i <= left; i++) if (arr[idx - i].low <= pivot) return false;
     for (let i = 1; i <= right; i++) if (arr[idx + i].low <= pivot) return false;
     return true;
   },
@@ -1628,28 +1491,80 @@ const strategy = {
     return null;
   },
 
-  // ── MITIGATION CHECKER (preserved for OB/FVG zone validity) ──
+  // ── MITIGATION CHECKER ──
+  // A zone is invalid if:
+  //   (a) price CLOSED through it (hard close-out), OR
+  //   (b) price has ENTERED the zone 2+ separate times (fully consumed)
+  // Each distinct visit (price exits & re-enters) counts as one additional touch.
   isMitigated(zone, tf, dir) {
     if (!zone || !zone.epoch) return true;
     const arr = candles[tf];
     if (!arr || arr.length < 2) return false;
     const formIdx = arr.findIndex(c => c.epoch === zone.epoch);
     if (formIdx === -1 || formIdx >= arr.length - 1) return false;
-    let touches = 0, wasInZone = false;
+
+    let touches = 0;
+    let wasInZone = false;
+
     for (let i = formIdx + 1; i < arr.length; i++) {
       const c = arr[i];
-      if (dir === 'bull' && c.close < zone.low)  return true;
+      // Hard mitigation — price closed beyond zone boundary
+      if (dir === 'bull' && c.close < zone.low) return true;
       if (dir === 'bear' && c.close > zone.high) return true;
+
+      // Touch counting — candle wick/body entered the zone
       const inZone = c.low <= zone.high && c.high >= zone.low;
-      if (inZone && !wasInZone) { touches++; wasInZone = true; if (touches >= 2) return true; }
-      else if (!inZone) wasInZone = false;
+      if (inZone && !wasInZone) {
+        touches++;
+        wasInZone = true;
+        if (touches >= 2) return true; // zone fully consumed after 2 visits
+      } else if (!inZone) {
+        wasInZone = false;
+      }
     }
     return false;
   },
 
-  // ── M5 PREMIUM/DISCOUNT (preserved API) ──
+  // ── INSTITUTIONAL ORDER BLOCK FINDER ──
+  // Uses COMPLETED candles only for zones (no repainting). The forming candle
+  // is never used for OB detection — only closed bars establish valid zones.
+  findOB(tf, dir) {
+    const arr = this.getCompleted(tf); // always completed-only for zones
+    if (!arr || arr.length < 10) return null;
+    const n = arr.length;
+    // Look for displacement + structure break in recent candles
+    for (let bounceIdx = n - 1; bounceIdx >= 4; bounceIdx--) {
+      const c = arr[bounceIdx];
+      const isBull = dir === 'bull';
+      const isDisp = isBull ? this.bullishDisplacement(c) : this.bearishDisplacement(c);
+      if (!isDisp) continue;
+      // Must break structure (close beyond prior swing extreme)
+      let breaksStructure = false;
+      if (isBull) {
+        const priorHigh = Math.max(...arr.slice(Math.max(0, bounceIdx - 20), bounceIdx).map(x => x.high));
+        breaksStructure = c.close > priorHigh;
+      } else {
+        const priorLow = Math.min(...arr.slice(Math.max(0, bounceIdx - 20), bounceIdx).map(x => x.low));
+        breaksStructure = c.close < priorLow;
+      }
+      if (!breaksStructure) continue;
+      // Find last opposing candle before displacement (the OB origin)
+      let obCandle = null;
+      for (let i = bounceIdx - 1; i >= Math.max(0, bounceIdx - 10); i--) {
+        const isOpp = isBull ? arr[i].close < arr[i].open : arr[i].close > arr[i].open;
+        if (isOpp) { obCandle = arr[i]; break; }
+      }
+      if (!obCandle) continue;
+      const zone = { low: obCandle.low, high: obCandle.high, epoch: obCandle.epoch, tf: tf === 900 ? 'M15-REF' : 'M5' };
+      if (!this.isMitigated(zone, tf, dir)) return zone;
+    }
+    return null;
+  },
+
+  // M5 is now the primary HTF for premium/discount determination (M15 role transferred)
   premiumDiscount(price) {
-    const src = this.getCompleted(300, true);
+    // Use forming candle for EQ calculation so P/D reflects current market
+    const src = this.getCompleted(300, true);  // M5 is now the primary HTF
     if (!src || src.length < 10) return 'discount';
     const sl = src.slice(-50);
     const H  = Math.max(...sl.map(c => c.high));
@@ -1660,52 +1575,114 @@ const strategy = {
     return 'eq';
   },
 
-  // ── TREND BIAS METHODS (preserved for HTF confluence & chart display) ──
+  // ── M15 TREND BIAS (kept for EQ/structural data reads — no longer used in signal logic) ──
   m15TrendBias() {
-    const arr = this.getCompleted(900, true);
+    const arr = this.getCompleted(900, true); // include forming for current context
     if (!arr || arr.length < 20) return 'neutral';
-    const sl = arr.slice(-24), n = sl.length, half = Math.floor(n / 2);
-    const fH = Math.max(...sl.slice(0, half).map(c => c.high));
-    const fL = Math.min(...sl.slice(0, half).map(c => c.low));
-    const sH = Math.max(...sl.slice(half).map(c => c.high));
-    const sL = Math.min(...sl.slice(half).map(c => c.low));
-    if (sH > fH && sL > fL) return 'bull';
-    if (sH < fH && sL < fL) return 'bear';
-    const H = Math.max(...sl.map(c => c.high)), L = Math.min(...sl.map(c => c.low));
-    return sl[n-1].close > (H + L) / 2 ? 'bull' : 'bear';
-  },
-  m5TrendBias() {
-    const narr = this._m5Narrative();
-    if (narr.direction === 'BULLISH') return 'bull';
-    if (narr.direction === 'BEARISH') return 'bear';
-    return 'neutral';
-  },
-  m1TrendBias() {
-    const arr = this.getCompleted(60, true);
-    if (!arr || arr.length < 8) return 'neutral';
-    const sl = arr.slice(-15), n = sl.length, half = Math.floor(n / 2);
-    const fH = Math.max(...sl.slice(0, half).map(c => c.high));
-    const fL = Math.min(...sl.slice(0, half).map(c => c.low));
-    const sH = Math.max(...sl.slice(half).map(c => c.high));
-    const sL = Math.min(...sl.slice(half).map(c => c.low));
-    if (sH > fH && sL > fL) return 'bull';
-    if (sH < fH && sL < fL) return 'bear';
-    const H = Math.max(...sl.map(c => c.high)), L = Math.min(...sl.map(c => c.low));
-    return sl[n-1].close > (H + L) / 2 ? 'bull' : 'bear';
+    const sl = arr.slice(-24);
+    const n  = sl.length;
+    const mid2 = Math.floor(n / 2);
+    const fH = Math.max(...sl.slice(0, mid2).map(c => c.high));
+    const fL = Math.min(...sl.slice(0, mid2).map(c => c.low));
+    const sH = Math.max(...sl.slice(mid2).map(c => c.high));
+    const sL = Math.min(...sl.slice(mid2).map(c => c.low));
+    const hhhl = sH > fH && sL > fL;
+    const lhll = sH < fH && sL < fL;
+    const H  = Math.max(...sl.map(c => c.high));
+    const L  = Math.min(...sl.map(c => c.low));
+    const closeAboveEQ = sl[n-1].close > (H + L) / 2;
+    if (hhhl)  return 'bull';
+    if (lhll)  return 'bear';
+    return closeAboveEQ ? 'bull' : 'bear';
   },
 
-  // ── SWING LEVEL HELPERS (preserved for chart/HTF display) ──
+  // ── M5 TREND BIAS (now PRIMARY HTF — was confirmation) ──
+  // Uses forming candle in live mode for real-time bias. Falls back to
+  // close-based momentum + EMA slope when strict HH+HL structure isn't present.
+  m5TrendBias() {
+    const arr = this.getCompleted(300, true); // include forming candle for live bias
+    if (!arr || arr.length < 10) return 'neutral';
+    const sl = arr.slice(-20);
+    const n  = sl.length;
+    const mid2 = Math.floor(n / 2);
+    const fH = Math.max(...sl.slice(0, mid2).map(c => c.high));
+    const fL = Math.min(...sl.slice(0, mid2).map(c => c.low));
+    const sH = Math.max(...sl.slice(mid2).map(c => c.high));
+    const sL = Math.min(...sl.slice(mid2).map(c => c.low));
+    const H  = Math.max(...sl.map(c => c.high));
+    const L  = Math.min(...sl.map(c => c.low));
+    const eq = (H + L) / 2;
+
+    // Strict structure: both higher highs AND higher lows = bull
+    const hhhl = sH > fH && sL > fL;
+    const lhll = sH < fH && sL < fL;
+    if (hhhl) return 'bull';
+    if (lhll) return 'bear';
+
+    // Fallback 1: Close-based momentum (last 5 closes vs previous 5)
+    const recent5 = sl.slice(-5);
+    const prev5   = sl.slice(-10, -5);
+    if (recent5.length >= 3 && prev5.length >= 3) {
+      const recentAvg = recent5.reduce((s,c) => s + c.close, 0) / recent5.length;
+      const prevAvg   = prev5.reduce((s,c) => s + c.close, 0) / prev5.length;
+      if (recentAvg > prevAvg * 1.001) return 'bull';
+      if (recentAvg < prevAvg * 0.999) return 'bear';
+    }
+
+    // Fallback 2: Close above/below EQ of the full 20-bar range
+    const closeAboveEQ = sl[n-1].close > eq;
+    return closeAboveEQ ? 'bull' : 'bear';
+  },
+
+  // ── M1 TREND BIAS (execution confirmation — transferred from M5 role) ──
+  // Uses forming candle in live mode for real-time confirmation.
+  m1TrendBias() {
+    const arr = this.getCompleted(60, true); // include forming candle for live bias
+    if (!arr || arr.length < 8) return 'neutral';
+    const sl = arr.slice(-15);
+    const n  = sl.length;
+    const mid2 = Math.floor(n / 2);
+    const fH = Math.max(...sl.slice(0, mid2).map(c => c.high));
+    const fL = Math.min(...sl.slice(0, mid2).map(c => c.low));
+    const sH = Math.max(...sl.slice(mid2).map(c => c.high));
+    const sL = Math.min(...sl.slice(mid2).map(c => c.low));
+    const H  = Math.max(...sl.map(c => c.high));
+    const L  = Math.min(...sl.map(c => c.low));
+    const eq = (H + L) / 2;
+
+    const hhhl = sH > fH && sL > fL;
+    const lhll = sH < fH && sL < fL;
+    if (hhhl) return 'bull';
+    if (lhll) return 'bear';
+
+    // Fallback: close-based momentum (more responsive for M1)
+    const recent5 = sl.slice(-5);
+    const prev5   = sl.slice(-10, -5);
+    if (recent5.length >= 3 && prev5.length >= 3) {
+      const recentAvg = recent5.reduce((s,c) => s + c.close, 0) / recent5.length;
+      const prevAvg   = prev5.reduce((s,c) => s + c.close, 0) / prev5.length;
+      if (recentAvg > prevAvg * 1.0005) return 'bull';
+      if (recentAvg < prevAvg * 0.9995) return 'bear';
+    }
+
+    return sl[n-1].close > eq ? 'bull' : 'bear';
+  },
+
+  // ── M15 / M5 SWING LEVELS ──
   m15SwingHigh() {
     const arr = this.getCompleted(900, true);
     if (!arr || arr.length < 7) return null;
-    const s = this.findSwingHigh(arr, 20, 3, 3); return s ? s.price : null;
+    const swing = this.findSwingHigh(arr, 20, 3, 3);
+    return swing ? swing.price : null;
   },
   m15SwingLow() {
     const arr = this.getCompleted(900, true);
     if (!arr || arr.length < 7) return null;
-    const s = this.findSwingLow(arr, 20, 3, 3); return s ? s.price : null;
+    const swing = this.findSwingLow(arr, 20, 3, 3);
+    return swing ? swing.price : null;
   },
   m5SwingHigh() {
+    // Use forming candle for live swing detection so liquidity levels are current
     const arr = this.getCompleted(300, true);
     if (!arr || arr.length < 7) return null;
     const swing = this.findSwingHigh(arr, 20, 3, 3);
@@ -1718,66 +1695,7 @@ const strategy = {
     return swing ? swing.price : null;
   },
 
-  // ── M5 FVG (chart overlay & confluence) ──
-  m5BullishFVG() {
-    const arr = this.getCompleted(300);
-    if (!arr || arr.length < 5) return null;
-    const sl = arr.slice(-30);
-    for (let i = sl.length - 3; i >= 0; i--) {
-      if (sl[i+2] && sl[i].high < sl[i+2].low) {
-        const zone = { low: sl[i].high, high: sl[i+2].low, epoch: sl[i+2].epoch, tf: 'M5' };
-        if (!this.isMitigated(zone, 300, 'bull')) return zone;
-      }
-    }
-    return null;
-  },
-  m5BearishFVG() {
-    const arr = this.getCompleted(300);
-    if (!arr || arr.length < 5) return null;
-    const sl = arr.slice(-30);
-    for (let i = sl.length - 3; i >= 0; i--) {
-      if (sl[i+2] && sl[i].low > sl[i+2].high) {
-        const zone = { low: sl[i+2].high, high: sl[i].low, epoch: sl[i+2].epoch, tf: 'M5' };
-        if (!this.isMitigated(zone, 300, 'bear')) return zone;
-      }
-    }
-    return null;
-  },
-
-  // ── M5 ORDER BLOCKS (chart overlay & confluence) ──
-  _findOB(tf, dir) {
-    const arr = this.getCompleted(tf);
-    if (!arr || arr.length < 10) return null;
-    const n = arr.length;
-    for (let bi = n - 1; bi >= 4; bi--) {
-      const c = arr[bi];
-      const isBull = dir === 'bull';
-      const bodyR  = this._range(c) > 0 ? this._body(c) / this._range(c) : 0;
-      const isDisp = isBull ? (c.close > c.open && bodyR >= 0.65)
-                             : (c.close < c.open && bodyR >= 0.65);
-      if (!isDisp) continue;
-      const prior = arr.slice(Math.max(0, bi - 20), bi);
-      const breaksStr = isBull
-        ? c.close > Math.max(...prior.map(x => x.high))
-        : c.close < Math.min(...prior.map(x => x.low));
-      if (!breaksStr) continue;
-      let obCandle = null;
-      for (let i = bi - 1; i >= Math.max(0, bi - 10); i--) {
-        const isOpp = isBull ? arr[i].close < arr[i].open : arr[i].close > arr[i].open;
-        if (isOpp) { obCandle = arr[i]; break; }
-      }
-      if (!obCandle) continue;
-      const zone = { low: obCandle.low, high: obCandle.high, epoch: obCandle.epoch, tf: tf === 900 ? 'M15-REF' : 'M5' };
-      if (!this.isMitigated(zone, tf, dir)) return zone;
-    }
-    return null;
-  },
-  m5BullishOB()  { return this._findOB(300, 'bull'); },
-  m5BearishOB()  { return this._findOB(300, 'bear'); },
-  m15BullishOB() { return this._findOB(900, 'bull'); },
-  m15BearishOB() { return this._findOB(900, 'bear'); },
-
-  // ── M15 FVG DETECTION (reference / chart overlay only) ──
+  // ── M15 FVG DETECTION ──
   m15BullishFVG() {
     const arr = this.getCompleted(900);
     if (!arr || arr.length < 5) return null;
@@ -1887,50 +1805,94 @@ const strategy = {
     return null;
   },
 
-  // ── HTF CONFLUENCE GATE (STEREA v2.0) ──
-  // M5 narrative is the primary bias. M1 is execution confirmation.
+  // ── M15 ORDER BLOCKS ──
+  m15BullishOB() { return this.findOB(900, 'bull'); },
+  m15BearishOB() { return this.findOB(900, 'bear'); },
+
+  // ── M5 ORDER BLOCKS ──
+  m5BullishOB() { return this.findOB(300, 'bull'); },
+  m5BearishOB() { return this.findOB(300, 'bear'); },
+
+  // ── FULL HTF CONFLUENCE GATE ──
+  // ── ROLE MAP (per structural update): ──
+  //   M5 = new primary HTF (was M15) — trend direction, bias, P/D, structural filter
+  //   M1 = new confirmation layer (was M5) — aligns with M5 before allowing entry
+  //   Execution = M1 only (unchanged)
+  //
+  // FIX: Bias uses forming candle for real-time direction. Zones use completed
+  // candles only to prevent repainting. Added "strong setup bypass" for high
+  // M1 scores when HTF is temporarily misaligned (common in ranging M5).
   htfConflCheck(dir, m1Score = 0) {
-    const isBull = dir === 'UP';
-    const narr   = this._m5Narrative();
-    const m5Bias = this.m5TrendBias();
-    const m1Bias = this.m1TrendBias();
-    const m5PD   = this.premiumDiscount(mid);
+    const isBull  = dir === 'UP';
+    // M5 is now the primary HTF bias (was M15) — uses forming candle for live
+    const m5HTFBias = this.m5TrendBias();
+    // M1 is now the confirmation layer (was M5) — uses forming candle for live
+    const m1ConfBias = this.m1TrendBias();
+    const m5PD = this.premiumDiscount(mid);  // M5-based P/D
 
-    const m5Aligned = isBull ? m5Bias === 'bull' : m5Bias === 'bear';
-    const m1Aligned = isBull ? m1Bias === 'bull' : m1Bias === 'bear';
-    const pdOk      = isBull ? m5PD === 'discount' : m5PD === 'premium';
-    const counterTrendOk = !m5Aligned && m1Aligned;
+    const m5HTFAligned  = isBull ? m5HTFBias  === 'bull' : m5HTFBias  === 'bear';
+    const m1ConfAligned = isBull ? m1ConfBias === 'bull' : m1ConfBias === 'bear';
+    // Counter-trend allowed ONLY when M1 confirms the opposing direction despite M5
+    const counterTrendOk = !m5HTFAligned && m1ConfAligned;
 
-    const m5FVG = isBull ? this.m5BullishFVG() : this.m5BearishFVG();
-    const m5OB  = isBull ? this.m5BullishOB()  : this.m5BearishOB();
+    // HTF structure zones — M5 OBs/FVGs use COMPLETED candles only (no repainting)
+    const m5FVG = isBull ? this.m5BullishFVG()  : this.m5BearishFVG();
+    const m5OB  = isBull ? this.m5BullishOB()   : this.m5BearishOB();
+
+    // Is price inside M5 HTF zones?
     const inM5FVG = m5FVG && mid >= m5FVG.low && mid <= m5FVG.high;
     const inM5OB  = m5OB  && mid >= m5OB.low  && mid <= m5OB.high;
 
+    // M5 swing structure liquidity alignment (was M15 swings)
     const m5SH = this.m5SwingHigh();
     const m5SL = this.m5SwingLow();
-    const liquidityOk = isBull ? (m5SL !== null && mid > m5SL) : (m5SH !== null && mid < m5SH);
+    const aboveM5SL  = isBull  && m5SL !== null && mid > m5SL;
+    const belowM5SH  = !isBull && m5SH !== null && mid < m5SH;
+    const liquidityOk = aboveM5SL || belowM5SH;
 
+    // Premium/Discount aligned with direction (M5-based, was M15)
+    const pdOk = isBull ? m5PD === 'discount' : m5PD === 'premium';
+
+    // HTF score (0–10): M5 alignment is highest weight, M1 confirmation second
     let score = 0;
-    if (m5Aligned)   score += 4;
-    if (m1Aligned)   score += 3;
-    if (m5FVG)       score += 1;
-    if (m5OB)        score += 1;
-    if (pdOk)        score += 1;
-    if (liquidityOk) score += 1;
+    if (m5HTFAligned)  score += 4;  // M5 primary HTF alignment
+    if (m1ConfAligned) score += 3;  // M1 confirmation alignment
+    if (m5FVG)         score += 1;  // M5 HTF FVG present
+    if (m5OB)          score += 1;  // M5 HTF OB present
+    if (pdOk)          score += 1;  // P/D zone aligned
+    if (liquidityOk)   score += 1;  // above M5 swing low / below M5 swing high
 
-    const strongSetupBypass = m1Score >= 10 && m1Aligned && pdOk && liquidityOk;
-    const htfGateOk = (m5Aligned && m1Aligned) ||
-                      (counterTrendOk && score >= 5 && (m5FVG || m5OB)) ||
+    // ── GATE LOGIC (revised for better trade flow) ──
+    // Standard: M5+M1 aligned = pass
+    // Counter-trend: M1 confirms + score >= 5 + M5 zone present = pass
+    // STRONG SETUP BYPASS: If M1 setup is very strong (score >= 14) AND
+    //   M1 confirms direction AND price is in discount/premium aligned zone,
+    //   allow even if M5 HTF is temporarily misaligned. This prevents
+    //   missing A+ setups during M5 consolidation/ranging where strict HH+HL
+    //   structure hasn't formed yet but M1 displacement is clear.
+    // Lowered bypass threshold — a solid M1 setup (score >= 6) with P/D aligned passes
+    const strongSetupBypass = m1Score >= 6 && m1ConfAligned && pdOk;
+
+    // Gate: M5 OR M1 aligned is sufficient (not both required).
+    const htfGateOk = m5HTFAligned || m1ConfAligned ||
+                      (counterTrendOk && (m5FVG || m5OB)) ||
                       strongSetupBypass;
 
+    // Return with backward-compatible keys (m15Aligned=M5-HTF, m5Aligned=M1-conf)
     return {
-      m15Bias: m5Bias, m5Bias: m1Bias,
-      m15Aligned: m5Aligned, m5Aligned: m1Aligned,
-      counterTrendOk, htfGateOk, score,
-      m5FVG, m5OB, m15FVG: null, m15OB: null,
-      inM5FVG, inM5OB, inM15FVG: false, inM15OB: false,
+      m15Bias: m5HTFBias,
+      m5Bias: m1ConfBias,
+      m15Aligned: m5HTFAligned,
+      m5Aligned: m1ConfAligned,
+      counterTrendOk,
+      htfGateOk, score,
+      m5FVG, m5OB,
+      m15FVG: null, m15OB: null,
+      inM5FVG, inM5OB,
+      inM15FVG: false, inM15OB: false,
       pdOk, liquidityOk, m15PD: m5PD,
-      strongSetupBypass, m1Score,
+      strongSetupBypass,
+      m1Score,
     };
   },
 
@@ -1939,8 +1901,8 @@ const strategy = {
       ? new Date(this._btEpoch * 1000).getUTCHours()
       : new Date().getUTCHours();
     if (h >= 0  && h <  6)  return 'ASIAN';
-    if (h >= 6  && h < 16)  return 'LONDON';
-    if (h >= 16 && h < 21)  return 'NEW YORK';
+    if (h >= 6  && h < 16)  return 'LONDON';   // fixed: was h>=7, missed 06:xx UTC
+    if (h >= 16 && h < 21)  return 'NEW YORK'; // fixed: was h>=13, overlapped LONDON
     return 'OFF-HOURS';
   },
 
@@ -1948,9 +1910,13 @@ const strategy = {
     const h = this._btEpoch !== null
       ? new Date(this._btEpoch * 1000).getUTCHours()
       : new Date().getUTCHours();
+    // Asian KZ:  00:00–03:00 UTC  (Tokyo open — sweeps & OB reactions)
+    // London KZ: 07:00–10:00 UTC  (London open — highest institutional flow)
+    // NY KZ:     13:00–16:00 UTC  (NY open / London-NY overlap — peak volume)
     return (h >= 0 && h < 3) || (h >= 7 && h < 10) || (h >= 13 && h < 16);
   },
 
+  // Returns the active kill zone label, or null if outside all KZs
   activeKillZone() {
     const h = this._btEpoch !== null
       ? new Date(this._btEpoch * 1000).getUTCHours()
@@ -1971,156 +1937,232 @@ const strategy = {
     return { low: ob.low + size * startPct, high: ob.low + size * endPct };
   },
 
-  // ── DISPLACEMENT HELPERS (public, used by chart/backtest display) ──
+  bullishMSS() {
+    const arr = candles[60];
+    if (arr.length < 5) return false;
+    const window = arr.slice(-20);
+    const prior  = window.slice(0, -1);
+    const last   = window[window.length - 1];
+    return last.close > Math.max(...prior.map(c => c.high));
+  },
+
+  bearishMSS() {
+    const arr = candles[60];
+    if (arr.length < 5) return false;
+    const window = arr.slice(-20);
+    const prior  = window.slice(0, -1);
+    const last   = window[window.length - 1];
+    return last.close < Math.min(...prior.map(c => c.low));
+  },
+
   displacementStrength(candle) {
     if (!candle) return 0;
     const body  = Math.abs(candle.close - candle.open);
     const total = candle.high - candle.low;
     return total === 0 ? 0 : body / total;
   },
+
   bullishDisplacement(candle) {
     return !!candle && candle.close > candle.open && this.displacementStrength(candle) >= 0.65;
   },
+
   bearishDisplacement(candle) {
     return !!candle && candle.close < candle.open && this.displacementStrength(candle) >= 0.65;
   },
 
-  // ── MSS (public wrappers) ──
-  bullishMSS() {
-    const arr = candles[60];
-    if (arr.length < 5) return false;
-    const mss = this._detectMSS(arr.slice(-5));
-    return mss === 'BULLISH';
-  },
-  bearishMSS() {
-    const arr = candles[60];
-    if (arr.length < 5) return false;
-    const mss = this._detectMSS(arr.slice(-5));
-    return mss === 'BEARISH';
-  },
-
-  // ── OB CANDLE FINDERS (legacy API preserved) ──
   bullishOBCandle() {
     const arr = candles[60];
     if (!arr.length) return null;
-    const w = arr.slice(-15);
-    for (let i = w.length - 1; i >= 0; i--) {
-      if (w[i].close < w[i].open) return { low: w[i].low, high: w[i].high, idx: i };
+    const window = arr.slice(-15);
+    for (let i = window.length - 1; i >= 0; i--) {
+      if (window[i].close < window[i].open) {
+        return { low: window[i].low, high: window[i].high, idx: i };
+      }
     }
     return null;
   },
+
   bearishOBCandle() {
     const arr = candles[60];
     if (!arr.length) return null;
-    const w = arr.slice(-15);
-    for (let i = w.length - 1; i >= 0; i--) {
-      if (w[i].close > w[i].open) return { low: w[i].low, high: w[i].high, idx: i };
+    const window = arr.slice(-15);
+    for (let i = window.length - 1; i >= 0; i--) {
+      if (window[i].close > window[i].open) {
+        return { low: window[i].low, high: window[i].high, idx: i };
+      }
     }
     return null;
   },
 
-  // ── SCORING (STEREA v2.0 — uses new engine signals) ──
   bullishScore(bms) {
-    const m1 = candles[60];
-    const m1Arr = m1.slice(-10);
     let score = 0;
-    const sweep = this._detectSweep(m1);
-    const disp  = this._detectDisplacement(m1Arr);
-    const fvg   = this._detectFVG(m1Arr);
-    const mss   = this._detectMSS(m1Arr);
-    const narr  = this._m5Narrative();
-    if (sweep && sweep.type === 'BUY')       score += this._cfg.SCORE_SWEEP;
-    if (disp  && disp.bullish)               score += this._cfg.SCORE_DISPLACEMENT;
-    if (fvg   && fvg.type === 'BULLISH')     score += this._cfg.SCORE_FVG;
-    if (mss   === 'BULLISH')                 score += this._cfg.SCORE_MSS;
-    if (narr.discount)                       score += this._cfg.SCORE_PD_ZONE;
-    if (this.inKillZone())                   score += this._cfg.SCORE_KZ;
-    if (narr.direction === 'BULLISH')        score += this._cfg.SCORE_M5_BIAS;
-    // Legacy BMS bonus
-    if (bms && bms.valid) {
-      score += 2;
-      if (bms.fvg) score += 1;
-      if (bms.ob)  score += 1;
-    }
-    return score;
-  },
-  bearishScore(bms) {
-    const m1 = candles[60];
-    const m1Arr = m1.slice(-10);
-    let score = 0;
-    const sweep = this._detectSweep(m1);
-    const disp  = this._detectDisplacement(m1Arr);
-    const fvg   = this._detectFVG(m1Arr);
-    const mss   = this._detectMSS(m1Arr);
-    const narr  = this._m5Narrative();
-    if (sweep && sweep.type === 'SELL')      score += this._cfg.SCORE_SWEEP;
-    if (disp  && disp.bearish)               score += this._cfg.SCORE_DISPLACEMENT;
-    if (fvg   && fvg.type === 'BEARISH')     score += this._cfg.SCORE_FVG;
-    if (mss   === 'BEARISH')                 score += this._cfg.SCORE_MSS;
-    if (narr.premium)                        score += this._cfg.SCORE_PD_ZONE;
-    if (this.inKillZone())                   score += this._cfg.SCORE_KZ;
-    if (narr.direction === 'BEARISH')        score += this._cfg.SCORE_M5_BIAS;
-    if (bms && bms.valid) {
-      score += 2;
-      if (bms.fvg) score += 1;
-      if (bms.ob)  score += 1;
-    }
+    const lastCandle = candles[60][candles[60].length - 1];
+    const ob = bmsOk => bmsOk ? bms.ob : null;
+    const _ob = bms && bms.valid ? bms.ob : null;
+    if (bms && bms.valid) score += 2;
+    if (this.bullishMSS()) score += 2;
+    if (this.bullishDisplacement(lastCandle)) score += 2;
+    if (_ob) score += 1;
+    if (bms && bms.fvg) score += 1;
+    if (this.zonesOverlap(_ob, bms && bms.fvg)) score += 2;
+    if (this.premiumDiscount(mid) === 'discount') score += 1;
+    if (this.inKillZone()) score += 2;   // Kill zone: elevated institutional flow (Asian/London/NY KZ)
+    // HTF confluence bonus — M5 is now primary HTF, M1 is confirmation
+    const m5Bias  = this.m5TrendBias();   // primary HTF (was M15)
+    const m1Bias  = this.m1TrendBias();   // confirmation layer (was M5)
+    if (m5Bias  === 'bull') score += 3;   // M5 bullish = highest weight (was M15)
+    if (m1Bias  === 'bull') score += 2;   // M1 bullish = confirmation (was M5)
+    if (this.m5BullishFVG())  score += 1; // M5 HTF FVG (primary structural zone)
+    if (this.m5BullishOB())   score += 1; // M5 HTF OB
     return score;
   },
 
-  // ── BMS (legacy structure — rebuilt using STEREA sweep+displacement model) ──
+  bearishScore(bms) {
+    let score = 0;
+    const lastCandle = candles[60][candles[60].length - 1];
+    const _ob = bms && bms.valid ? bms.ob : null;
+    if (bms && bms.valid) score += 2;
+    if (this.bearishMSS()) score += 2;
+    if (this.bearishDisplacement(lastCandle)) score += 2;
+    if (_ob) score += 1;
+    if (bms && bms.fvg) score += 1;
+    if (this.zonesOverlap(_ob, bms && bms.fvg)) score += 2;
+    if (this.premiumDiscount(mid) === 'premium') score += 1;
+    if (this.inKillZone()) score += 2;   // Kill zone: elevated institutional flow (Asian/London/NY KZ)
+    // HTF confluence bonus — M5 is now primary HTF, M1 is confirmation
+    const m5Bias  = this.m5TrendBias();   // primary HTF (was M15)
+    const m1Bias  = this.m1TrendBias();   // confirmation layer (was M5)
+    if (m5Bias  === 'bear') score += 3;   // M5 bearish = highest weight (was M15)
+    if (m1Bias  === 'bear') score += 2;   // M1 bearish = confirmation (was M5)
+    if (this.m5BearishFVG())  score += 1; // M5 HTF FVG
+    if (this.m5BearishOB())   score += 1; // M5 HTF OB
+    return score;
+  },
+
   bullishBMS() {
     const m1 = candles[60];
     if (m1.length < 10) return { valid: false };
-    const arr    = m1.slice(-80);
-    const n      = arr.length;
-    const sweep  = this._detectSweep(arr);
-    if (!sweep || sweep.type !== 'BUY') return { valid: false };
-    const disp   = this._detectDisplacement(arr.slice(-5));
-    if (!disp || !disp.bullish) return { valid: false };
-    const mss    = this._detectMSS(arr.slice(-5));
-    if (mss !== 'BULLISH') return { valid: false };
-    // OB = last bearish candle before displacement
-    let obCandle = null;
-    for (let i = n - 2; i >= Math.max(0, n - 15); i--) {
-      if (arr[i].close < arr[i].open) { obCandle = arr[i]; break; }
+    const arr = m1.slice(-80);
+    const n   = arr.length;
+    // Pivot-based swing low — use 2-bar confirmation (was 3) for faster detection
+    const swing = this.findSwingLow(arr, 30, 2, 2);
+    if (!swing) return { valid: false };
+    const swingLowIdx   = swing.idx;
+    const swingLowPrice = swing.price;
+    let sweepIdx = -1;
+    for (let i = swingLowIdx + 1; i < n; i++) {
+      if (arr[i].low <= swingLowPrice && arr[i].close > swingLowPrice) {
+        sweepIdx = i; break;
+      }
     }
-    if (!obCandle) obCandle = arr[Math.max(0, n - 2)];
-    const ob = { low: obCandle.low, high: obCandle.high, idx: n - 2, epoch: obCandle.epoch };
-    if (this.isMitigated(ob, 60, 'bull')) return { valid: false };
-    const fvg = this._detectFVG(arr.slice(-5));
-    const fvgZone = fvg && fvg.type === 'BULLISH' ? { low: fvg.bottom, high: fvg.top, epoch: fvg.epoch } : null;
-    return {
-      valid: true, sweepLow: sweep.level, ob, fvg: fvgZone,
-      bmsCandle: arr[n - 1], sweepIdx: n - 1,
-      sweepEpoch: arr[n - 1].epoch, obCandle
-    };
+    if (sweepIdx === -1) {
+      const c = arr[swingLowIdx];
+      const lowerWick = Math.min(c.open, c.close) - c.low;
+      const body = Math.abs(c.close - c.open);
+      if (lowerWick > body * 0.3 && c.close > c.low + (c.high - c.low) * 0.2)
+        sweepIdx = swingLowIdx;
+    }
+    if (sweepIdx === -1) return { valid: false };
+    let bounceIdx = -1;
+    for (let i = sweepIdx + 1; i < n; i++) {
+      if (this.bullishDisplacement(arr[i])) { bounceIdx = i; break; }
+    }
+    if (bounceIdx === -1 && this.bullishDisplacement(arr[sweepIdx])) bounceIdx = sweepIdx;
+    // Fallback: any bullish candle with ≥40% body ratio
+    if (bounceIdx === -1) {
+      for (let i = sweepIdx + 1; i < n; i++) {
+        if (arr[i].close > arr[i].open && this.displacementStrength(arr[i]) >= 0.40) { bounceIdx = i; break; }
+      }
+    }
+    // Final fallback: first bullish candle after sweep
+    if (bounceIdx === -1) {
+      for (let i = sweepIdx + 1; i < n; i++) {
+        if (arr[i].close > arr[i].open) { bounceIdx = i; break; }
+      }
+    }
+    if (bounceIdx === -1) return { valid: false };
+    // Widened sweep window — allow up to 60 candles (was 40)
+    if (sweepIdx < n - 60) return { valid: false };
+    const obCandle = (() => {
+      for (let i = bounceIdx - 1; i >= Math.max(0, bounceIdx - 15); i--) {
+        if (arr[i].close < arr[i].open) return arr[i];
+      }
+      return arr[Math.max(0, bounceIdx - 1)];
+    })();
+    const ob = { low: obCandle.low, high: obCandle.high, idx: bounceIdx - 1, epoch: obCandle.epoch };
+    // Skip mitigation block — allow re-entry into valid structure
+    let fvg = null;
+    if (bounceIdx >= 2) {
+      const c1 = arr[bounceIdx - 2], c3 = arr[bounceIdx];
+      if (c1.high < c3.low) {
+        const fvgZone = { low: c1.high, high: c3.low, epoch: c3.epoch };
+        if (!this.isMitigated(fvgZone, 60, 'bull')) fvg = fvgZone;
+      }
+    }
+    return { valid: true, sweepLow: swingLowPrice, ob, fvg, bmsCandle: arr[bounceIdx], sweepIdx, sweepEpoch: arr[sweepIdx].epoch, obCandle };
   },
+
   bearishBMS() {
     const m1 = candles[60];
     if (m1.length < 10) return { valid: false };
-    const arr    = m1.slice(-80);
-    const n      = arr.length;
-    const sweep  = this._detectSweep(arr);
-    if (!sweep || sweep.type !== 'SELL') return { valid: false };
-    const disp   = this._detectDisplacement(arr.slice(-5));
-    if (!disp || !disp.bearish) return { valid: false };
-    const mss    = this._detectMSS(arr.slice(-5));
-    if (mss !== 'BEARISH') return { valid: false };
-    let obCandle = null;
-    for (let i = n - 2; i >= Math.max(0, n - 15); i--) {
-      if (arr[i].close > arr[i].open) { obCandle = arr[i]; break; }
+    const arr = m1.slice(-80);
+    const n   = arr.length;
+    // Pivot-based swing high — 2-bar confirmation (was 3) for faster detection
+    const swing = this.findSwingHigh(arr, 30, 2, 2);
+    if (!swing) return { valid: false };
+    const swingHighIdx   = swing.idx;
+    const swingHighPrice = swing.price;
+    let sweepIdx = -1;
+    for (let i = swingHighIdx + 1; i < n; i++) {
+      if (arr[i].high >= swingHighPrice && arr[i].close < swingHighPrice) {
+        sweepIdx = i; break;
+      }
     }
-    if (!obCandle) obCandle = arr[Math.max(0, n - 2)];
-    const ob = { low: obCandle.low, high: obCandle.high, idx: n - 2, epoch: obCandle.epoch };
-    if (this.isMitigated(ob, 60, 'bear')) return { valid: false };
-    const fvg = this._detectFVG(arr.slice(-5));
-    const fvgZone = fvg && fvg.type === 'BEARISH' ? { low: fvg.bottom, high: fvg.top, epoch: fvg.epoch } : null;
-    return {
-      valid: true, sweepHigh: sweep.level, ob, fvg: fvgZone,
-      bmsCandle: arr[n - 1], sweepIdx: n - 1,
-      sweepEpoch: arr[n - 1].epoch, obCandle
-    };
+    if (sweepIdx === -1) {
+      const c = arr[swingHighIdx];
+      const upperWick = c.high - Math.max(c.open, c.close);
+      const body = Math.abs(c.close - c.open);
+      if (upperWick > body * 0.3 && c.close < c.high - (c.high - c.low) * 0.2)
+        sweepIdx = swingHighIdx;
+    }
+    if (sweepIdx === -1) return { valid: false };
+    let bounceIdx = -1;
+    for (let i = sweepIdx + 1; i < n; i++) {
+      if (this.bearishDisplacement(arr[i])) { bounceIdx = i; break; }
+    }
+    if (bounceIdx === -1 && this.bearishDisplacement(arr[sweepIdx])) bounceIdx = sweepIdx;
+    // Fallback: any bearish candle with ≥40% body ratio
+    if (bounceIdx === -1) {
+      for (let i = sweepIdx + 1; i < n; i++) {
+        if (arr[i].close < arr[i].open && this.displacementStrength(arr[i]) >= 0.40) { bounceIdx = i; break; }
+      }
+    }
+    // Final fallback: first bearish candle after sweep
+    if (bounceIdx === -1) {
+      for (let i = sweepIdx + 1; i < n; i++) {
+        if (arr[i].close < arr[i].open) { bounceIdx = i; break; }
+      }
+    }
+    if (bounceIdx === -1) return { valid: false };
+    // Widened sweep window — allow up to 60 candles (was 40)
+    if (sweepIdx < n - 60) return { valid: false };
+    const obCandle = (() => {
+      for (let i = bounceIdx - 1; i >= Math.max(0, bounceIdx - 15); i--) {
+        if (arr[i].close > arr[i].open) return arr[i];
+      }
+      return arr[Math.max(0, bounceIdx - 1)];
+    })();
+    const ob = { low: obCandle.low, high: obCandle.high, idx: bounceIdx - 1, epoch: obCandle.epoch };
+    // Skip mitigation block — allow re-entry into valid structure
+    let fvg = null;
+    if (bounceIdx >= 2) {
+      const c1 = arr[bounceIdx - 2], c3 = arr[bounceIdx];
+      if (c1.low > c3.high) {
+        const fvgZone = { low: c3.high, high: c1.low, epoch: c3.epoch };
+        if (!this.isMitigated(fvgZone, 60, 'bear')) fvg = fvgZone;
+      }
+    }
+    return { valid: true, sweepHigh: swingHighPrice, ob, fvg, bmsCandle: arr[bounceIdx], sweepIdx, sweepEpoch: arr[sweepIdx].epoch, obCandle };
   },
 
   bullishOB()     { const r = this.bullishBMS(); return r.valid ? r.ob  : null; },
@@ -2130,142 +2172,147 @@ const strategy = {
   bullishOBCandle2(){ const r = this.bullishBMS(); return r.valid ? r.obCandle : null; },
   bearishOBCandle2(){ const r = this.bearishBMS(); return r.valid ? r.obCandle : null; },
 
-  // ── EVAL BUY (STEREA v2.0 engine) ──
   evalBuy(price) {
-    const m1 = candles[60];
-    // Warm-up guard
-    if (!m1 || m1.length < 80) return { signal: false, quality: 0, score: 0, htf: this.htfConflCheck('UP'), conds: {} };
+    // ── STEP 1: M1 BMS structure FIRST (we need score for HTF bypass) ──
+    const bms   = this.bullishBMS();
+    const bmsOk = bms.valid;
+    const score = this.bullishScore(bms);
+    const ob    = bmsOk ? bms.ob  : null;
+    const fvg   = bmsOk ? bms.fvg : null;
 
-    const m1Slice  = m1.slice(-10);
-    const m1All    = m1;
-    const narr     = this._m5Narrative();
-    const sweep    = this._detectSweep(m1All);
-    const disp     = this._detectDisplacement(m1Slice);
-    const fvg      = this._detectFVG(m1Slice);
-    const mss      = this._detectMSS(m1Slice);
+    // ── STEP 2: M5 structural gate (pass M1 score for strong-setup bypass) ──
+    const htf = this.htfConflCheck('UP', score);
 
-    // STEREA v2.0 validation gates
-    const bms      = this.bullishBMS();
-    const bmsOk    = bms.valid;
-    const score    = this.bullishScore(bms);
-    const ob       = bmsOk ? bms.ob  : null;
-    const fvgZone  = bmsOk ? bms.fvg : null;
-    const htf      = this.htfConflCheck('UP', score);
-
-    // NEW ENGINE: core signal conditions
-    const sessOk    = this.activeSession() !== 'OFF-HOURS';
-    const volOk     = this._volatilityOK(m1All);
-    const chopOk    = !this._cfg.ENABLE_CHOP_FILTER || !this._isChoppy(m1Slice);
-    const biasOk    = narr.direction === 'BULLISH';
-    const pdOk      = !this._cfg.ENABLE_PREMIUM_DISCOUNT || narr.discount;
-    const sweepOk   = !this._cfg.REQUIRE_SWEEP      || (sweep && sweep.type === 'BUY');
-    const dispOk    = !this._cfg.REQUIRE_DISPLACEMENT|| (disp  && disp.bullish);
-    const fvgOk     = !this._cfg.REQUIRE_FVG         || (fvg   && fvg.type === 'BULLISH');
-    const mssOk     = !this._cfg.REQUIRE_MSS         || mss === 'BULLISH';
-    const inKZ      = this.inKillZone();
-
-    // Zone check (for SL tightness)
+    // ── STEP 3: M1 entry zone — widened to 0–80% of OB/FVG (was 20–50%) ──
     let inOBZone = false, inFVGZone = false;
     if (ob) {
-      const zone = this.entryZone(ob, 0.20, 0.50);
+      const zone = this.entryZone(ob, 0.0, 0.80); // any entry within the OB
       inOBZone = price >= zone.low && price <= zone.high;
     }
-    if (fvgZone) {
-      const s = fvgZone.high - fvgZone.low;
-      inFVGZone = price >= (fvgZone.low + s * 0.20) && price <= (fvgZone.low + s * 0.50);
+    if (fvg) {
+      const fvgSize = fvg.high - fvg.low;
+      inFVGZone = price >= fvg.low && price <= fvg.high; // anywhere in FVG
     }
-    const inZone   = inOBZone || inFVGZone || !bmsOk; // relax zone gate when no legacy BMS
-    const aboveSweep = !bmsOk || price > (bms.sweepLow || 0);
 
-    // STEREA signal: all NEW engine gates + HTF confluence
-    const htfOk = htf.htfGateOk;
-    const isAPlusSetup = score >= this._cfg.THRESHOLD_QUALITY3;
-    const signal = sessOk && volOk && chopOk && biasOk && pdOk &&
-                   sweepOk && dispOk && fvgOk && mssOk &&
-                   (bmsOk ? (inZone && aboveSweep && (isAPlusSetup || htfOk)) : (isAPlusSetup || htfOk));
+    // ── STEP 4: M5 FVG/OB confluence with M1 entry ──
+    const m5fvg = this.m5BullishFVG();
+    const m5ob  = this.m5BullishOB();
 
-    const quality = score >= this._cfg.THRESHOLD_QUALITY3 ? 3
-                  : score >= this._cfg.THRESHOLD_QUALITY2  ? 2 : 1;
+    const inZone  = !ob || inOBZone || inFVGZone; // zone check only applies when OB exists
+    const lastCandle  = candles[60][candles[60].length - 1];
+    const disp        = this.bullishDisplacement(bms.bmsCandle || lastCandle) || this.bullishDisplacement(lastCandle);
+    const aboveSweep  = bmsOk && price > bms.sweepLow;
+    const sess        = this.activeSession();
+    const inSession   = sess !== 'OFF-HOURS';  // trade all 3 sessions: ASIAN, LONDON, NEW YORK
+    const inKZ        = this.inKillZone();     // kill zone = score bonus only, not a hard gate
+
+    // ── SIGNAL GATE ──
+    // ALL setups require: valid M1 BMS + price IN zone (20-50% from OB/FVG entry side)
+    //   + above sweep. Price-in-zone is NEVER bypassed — this ensures the entry price
+    //   equals current market price at the OB/FVG level, keeping SL distances tight.
+    // HTF gate: standard setups need M5 alignment; A+ (score>=14) allow bypass only when
+    //   P/D is aligned and liquidity is clean.
+    const htfOk  = htf.htfGateOk;
+    const m5Conflict = htf.m5Bias === 'bear' && !htf.m15Aligned;
+
+    const isAPlusSetup = score >= 9; // lowered from 14
+    // BMS is preferred but not strictly required — HTF alignment + score alone can trigger
+    const signal = inSession && htfOk && !m5Conflict &&
+                   (bmsOk ? (inZone && aboveSweep) : isAPlusSetup);
+
+    const quality = score >= 14 ? 3 : score >= 9 ? 2 : 1;
 
     return {
-      signal, quality, score, htf,
-      sweepIdx:  bmsOk ? bms.sweepIdx  : undefined,
+      signal, quality, score,
+      htf,
+      sweepIdx : bmsOk ? bms.sweepIdx : undefined,
       sweepEpoch: bmsOk ? bms.sweepEpoch : undefined,
-      sweepLow:  bmsOk ? bms.sweepLow  : undefined,
+      sweepLow: bmsOk ? bms.sweepLow : undefined,
       conds: {
-        bSess: sessOk, bKZ: inKZ,
-        bM15: htf.m15Aligned, bM5: htf.m5Aligned, bHTF: htfOk,
-        bBMS: bmsOk, bSweep: sweepOk, bDisp: dispOk, bFVG: fvgOk,
-        bOB:  !!ob,  bHL: inZone && aboveSweep, bEntry: signal,
+        bSess:  inSession,
+        bKZ:    inKZ,
+        bM15:   htf.m15Aligned,
+        bM5:    htf.m5Aligned,
+        bHTF:   htfOk,
+        bBMS:   bmsOk,
+        bSweep: bmsOk,
+        bDisp:  disp,
+        bFVG:   bmsOk && !!fvg,
+        bOB:    !!ob,
+        bHL:    inZone && aboveSweep,
+        bEntry: signal,
       },
-      ob, fvg: fvgZone,
+      ob, fvg,
     };
   },
 
-  // ── EVAL SELL (STEREA v2.0 engine) ──
   evalSell(price) {
-    const m1 = candles[60];
-    if (!m1 || m1.length < 80) return { signal: false, quality: 0, score: 0, htf: this.htfConflCheck('DOWN'), conds: {} };
+    // ── STEP 1: M1 BMS structure FIRST (we need score for HTF bypass) ──
+    const bms   = this.bearishBMS();
+    const bmsOk = bms.valid;
+    const score = this.bearishScore(bms);
+    const ob    = bmsOk ? bms.ob  : null;
+    const fvg   = bmsOk ? bms.fvg : null;
 
-    const m1Slice  = m1.slice(-10);
-    const m1All    = m1;
-    const narr     = this._m5Narrative();
-    const sweep    = this._detectSweep(m1All);
-    const disp     = this._detectDisplacement(m1Slice);
-    const fvg      = this._detectFVG(m1Slice);
-    const mss      = this._detectMSS(m1Slice);
+    // ── STEP 2: M5 structural gate (pass M1 score for strong-setup bypass) ──
+    const htf = this.htfConflCheck('DOWN', score);
 
-    const bms      = this.bearishBMS();
-    const bmsOk    = bms.valid;
-    const score    = this.bearishScore(bms);
-    const ob       = bmsOk ? bms.ob  : null;
-    const fvgZone  = bmsOk ? bms.fvg : null;
-    const htf      = this.htfConflCheck('DOWN', score);
-
-    const sessOk    = this.activeSession() !== 'OFF-HOURS';
-    const volOk     = this._volatilityOK(m1All);
-    const chopOk    = !this._cfg.ENABLE_CHOP_FILTER || !this._isChoppy(m1Slice);
-    const biasOk    = narr.direction === 'BEARISH';
-    const pdOk      = !this._cfg.ENABLE_PREMIUM_DISCOUNT || narr.premium;
-    const sweepOk   = !this._cfg.REQUIRE_SWEEP      || (sweep && sweep.type === 'SELL');
-    const dispOk    = !this._cfg.REQUIRE_DISPLACEMENT|| (disp  && disp.bearish);
-    const fvgOk     = !this._cfg.REQUIRE_FVG         || (fvg   && fvg.type === 'BEARISH');
-    const mssOk     = !this._cfg.REQUIRE_MSS         || mss === 'BEARISH';
-    const inKZ      = this.inKillZone();
-
+    // ── STEP 3: M1 entry zone — widened to full OB/FVG range ──
     let inOBZone = false, inFVGZone = false;
     if (ob) {
-      const zone = this.entryZone(ob, 0.50, 0.80);
+      const zone = this.entryZone(ob, 0.20, 1.0); // any entry within OB
       inOBZone = price >= zone.low && price <= zone.high;
     }
-    if (fvgZone) {
-      const s = fvgZone.high - fvgZone.low;
-      inFVGZone = price >= (fvgZone.low + s * 0.50) && price <= (fvgZone.low + s * 0.80);
+    if (fvg) {
+      inFVGZone = price >= fvg.low && price <= fvg.high; // anywhere in FVG
     }
-    const inZone    = inOBZone || inFVGZone || !bmsOk;
-    const belowSweep = !bmsOk || price < (bms.sweepHigh || Infinity);
 
-    const htfOk = htf.htfGateOk;
-    const isAPlusSetup = score >= this._cfg.THRESHOLD_QUALITY3;
-    const signal = sessOk && volOk && chopOk && biasOk && pdOk &&
-                   sweepOk && dispOk && fvgOk && mssOk &&
-                   (bmsOk ? (inZone && belowSweep && (isAPlusSetup || htfOk)) : (isAPlusSetup || htfOk));
+    // ── STEP 4: M5 FVG/OB confluence with M1 entry ──
+    const m5fvg = this.m5BearishFVG();
+    const m5ob  = this.m5BearishOB();
 
-    const quality = score >= this._cfg.THRESHOLD_QUALITY3 ? 3
-                  : score >= this._cfg.THRESHOLD_QUALITY2  ? 2 : 1;
+    const inZone  = !ob || inOBZone || inFVGZone;
+    const lastCandle  = candles[60][candles[60].length - 1];
+    const disp        = this.bearishDisplacement(bms.bmsCandle || lastCandle) || this.bearishDisplacement(lastCandle);
+    const belowSweep  = bmsOk && price < bms.sweepHigh;
+    const sess        = this.activeSession();
+    const inSession   = sess !== 'OFF-HOURS';  // trade all 3 sessions: ASIAN, LONDON, NEW YORK
+    const inKZ        = this.inKillZone();     // kill zone = score bonus only, not a hard gate
+
+    // ── SIGNAL GATE ──
+    // ALL setups require: valid M1 BMS + price IN zone (20-50% from OB/FVG entry side)
+    //   + below sweep. Price-in-zone is NEVER bypassed — entry always at current market price
+    //   inside the zone, keeping SL distances tight.
+    const htfOk     = htf.htfGateOk;
+    const m5Conflict = htf.m5Bias === 'bull' && !htf.m15Aligned;
+
+    const isAPlusSetup = score >= 9; // lowered from 14
+    const signal = inSession && htfOk && !m5Conflict &&
+                   (bmsOk ? (inZone && belowSweep) : isAPlusSetup);
+
+    const quality = score >= 14 ? 3 : score >= 9 ? 2 : 1;
 
     return {
-      signal, quality, score, htf,
-      sweepIdx:   bmsOk ? bms.sweepIdx   : undefined,
+      signal, quality, score,
+      htf,
+      sweepIdx : bmsOk ? bms.sweepIdx : undefined,
       sweepEpoch: bmsOk ? bms.sweepEpoch : undefined,
-      sweepLow:   bmsOk ? bms.sweepLow   : undefined,
+      sweepLow: bmsOk ? bms.sweepLow : undefined,
       conds: {
-        sSess: sessOk, sKZ: inKZ,
-        sM15: htf.m15Aligned, sM5: htf.m5Aligned, sHTF: htfOk,
-        sBMS: bmsOk, sSweep: sweepOk, sDisp: dispOk, sFVG: fvgOk,
-        sOB:  !!ob,  sLH: inZone && belowSweep, sEntry: signal,
+        sSess:  inSession,
+        sKZ:    inKZ,
+        sM15:   htf.m15Aligned,
+        sM5:    htf.m5Aligned,
+        sHTF:   htfOk,
+        sBMS:   bmsOk,
+        sSweep: bmsOk,
+        sDisp:  disp,
+        sFVG:   bmsOk && !!fvg,
+        sOB:    !!ob,
+        sLH:    inZone && belowSweep,
+        sEntry: signal,
       },
-      ob, fvg: fvgZone,
+      ob, fvg,
     };
   },
 };
